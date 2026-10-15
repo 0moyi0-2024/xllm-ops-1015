@@ -781,6 +781,16 @@ at::Tensor hc_post_impl_npu(const at::Tensor& x,
   return y;
 }
 
+at::Tensor hc_post_va_impl_npu(const at::Tensor& x,
+                               const at::Tensor& residual,
+                               const at::Tensor& post,
+                               const at::Tensor& comb) {
+  // y has the same shape / dtype as residual ([bs, hc, d]).
+  at::Tensor y = at::empty(residual.sizes(), residual.options());
+  EXEC_NPU_CMD(aclnnHcPostVa, x, residual, post, comb, y);
+  return y;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_bias_impl_npu(
     const at::Tensor& x1,
     const at::Tensor& x2,
@@ -2139,6 +2149,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "reshape_and_cache_a5");
   m.def("inplace_partial_rotary_mul", &inplace_partial_rotary_mul_impl_npu, "inplace_partial_rotary_mul");
   m.def("hc_post", &hc_post_impl_npu, "hc_post");
+  m.def("hc_post_va", &hc_post_va_impl_npu, "hc_post_va");
   m.def("add_rms_norm_bias", &add_rms_norm_bias_impl_npu, "add_rms_norm_bias");
   m.def("gamma_add_rms_norm",
         &gamma_add_rms_norm_impl_npu,

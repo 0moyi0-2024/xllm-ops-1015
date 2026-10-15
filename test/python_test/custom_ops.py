@@ -208,6 +208,10 @@ def hc_post_npu(x, residual, post, comb):
     return custom_ops_lib.hc_post(x, residual, post, comb)
 
 
+def hc_post_va_npu(x, residual, post, comb):
+    return custom_ops_lib.hc_post_va(x, residual, post, comb)
+
+
 def add_rms_norm_bias_npu(x1, x2, gamma, beta=None, eps=1e-6):
     return custom_ops_lib.add_rms_norm_bias(x1, x2, gamma, beta, eps)
 
