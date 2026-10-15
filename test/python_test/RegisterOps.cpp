@@ -225,7 +225,9 @@ at::Tensor x_flash_attention_infer_impl_npu(
   // aclnn expects layout as char* (1 slot). Passing c10::string_view
   // (16 bytes = 2 slots) shifts subsequent args -> SIGSEGV.
   char* layout_c = const_cast<char*>(layout.c_str());
-  const c10::optional<at::Tensor> kvstarts = c10::nullopt;
+  // ConvertTypes(Ts&...) binds by lvalue ref; optional args must be named
+  // lvalues (an rvalue temporary fails to compile).
+  const c10::optional<at::Tensor> kvstarts_opt = c10::nullopt;
   EXEC_NPU_CMD(aclnnXFlashAttentionInfer,
                query,
                key_cache,
@@ -235,7 +237,7 @@ at::Tensor x_flash_attention_infer_impl_npu(
                actual_q_lens,
                actual_kv_lens,
                extra_tiling,
-               kvstarts,
+               kvstarts_opt,  // kvstarts: full KV prefix
                layout_c,
                qHead,
                kvHead,
@@ -295,6 +297,121 @@ at::Tensor multi_latent_attention_impl_npu(
                atten_out,
                lse_out);
   return atten_out;
+}
+
+// kv_quant_sparse_flash_attention_va: paged KV int8-quant sparse flash
+// attention (vLLM variant, separate NoPE/RoPE head dim). Signature mirrors
+// xllm_ops op_adpt kv_quant_sparse_flash_attention_va_torch_adpt.h.
+// Returns (attention_out, softmax_max, softmax_sum); softmax outputs are
+// empty ({0}) unless return_softmax_lse is true.
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+kv_quant_sparse_flash_attention_va_impl_npu(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& sparse_indices,
+    double scale_value,
+    int64_t key_quant_mode,
+    int64_t value_quant_mode,
+    const c10::optional<at::Tensor>& key_dequant_scale,
+    const c10::optional<at::Tensor>& value_dequant_scale,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
+    int64_t sparse_block_size,
+    const std::string& layout_query,
+    const std::string& layout_kv,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t attention_mode,
+    int64_t quant_scale_repo_mode,
+    int64_t tile_size,
+    int64_t rope_head_dim,
+    bool return_softmax_lse) {
+  constexpr int64_t DIM_0 = 0;
+  constexpr int64_t DIM_1 = 1;
+  constexpr int64_t DIM_2 = 2;
+  constexpr int64_t DIM_3 = 3;
+
+  TORCH_CHECK(layout_query == "BSND" || layout_query == "TND",
+              "The layout of query only support BSND and TND, but got ",
+              layout_query);
+  for (size_t i = 0; i < query.sizes().size(); ++i) {
+    TORCH_CHECK(query.size(i) > 0,
+                "All values within query's shape should be greater than 0, "
+                "but shape[", i, "] is ", query.size(i));
+  }
+
+  at::SmallVector<int64_t, 8> out_size;
+  if (layout_query == "BSND") {
+    TORCH_CHECK(query.dim() == 4,
+                "When the layout of query is BSND, the query dimension must "
+                "be 4, but got ", query.dim());
+    out_size = {query.size(DIM_0), query.size(DIM_1), query.size(DIM_2),
+                query.size(DIM_3) - rope_head_dim};
+  } else {
+    TORCH_CHECK(query.dim() == 3,
+                "When the layout of query is TND, the query dimension must "
+                "be 3, but got ", query.dim());
+    out_size = {query.size(DIM_0), query.size(DIM_1),
+                query.size(DIM_2) - rope_head_dim};
+  }
+  at::Tensor attention_out = at::empty(out_size, query.options());
+
+  at::SmallVector<int64_t, 8> softmax_size;
+  if (return_softmax_lse) {
+    if (query.dim() == 3) {
+      const int64_t kv_head_dim =
+          layout_kv == "PA_BSND" ? key.size(DIM_2) : key.size(DIM_1);
+      softmax_size = {kv_head_dim, query.size(DIM_0),
+                      query.size(DIM_1) / kv_head_dim};
+    } else {
+      softmax_size = {query.size(DIM_0), key.size(DIM_2), query.size(DIM_1),
+                      query.size(DIM_2) / key.size(DIM_2)};
+    }
+  } else {
+    softmax_size = {0};
+  }
+  at::Tensor softmax_max =
+      at::empty(softmax_size, query.options().dtype(at::kFloat));
+  at::Tensor softmax_sum =
+      at::empty(softmax_size, query.options().dtype(at::kFloat));
+
+  // layout strings must be passed via named char* lvalues; a temporary's
+  // c_str() in the varargs below -> SIGSEGV (see laser_attention).
+  char* layout_query_ptr = const_cast<char*>(layout_query.c_str());
+  char* layout_kv_ptr = const_cast<char*>(layout_kv.c_str());
+
+  EXEC_NPU_CMD(aclnnKvQuantSparseFlashAttentionVa,
+               query,
+               key,
+               value,
+               sparse_indices,
+               key_dequant_scale,
+               value_dequant_scale,
+               block_table,
+               actual_seq_lengths_query,
+               actual_seq_lengths_kv,
+               scale_value,
+               key_quant_mode,
+               value_quant_mode,
+               sparse_block_size,
+               layout_query_ptr,
+               layout_kv_ptr,
+               sparse_mode,
+               pre_tokens,
+               next_tokens,
+               attention_mode,
+               quant_scale_repo_mode,
+               tile_size,
+               rope_head_dim,
+               return_softmax_lse,
+               attention_out,
+               softmax_max,
+               softmax_sum);
+  return std::tuple<at::Tensor, at::Tensor, at::Tensor>(
+      attention_out, softmax_max, softmax_sum);
 }
 
 at::Tensor causal_conv1d(
@@ -877,6 +994,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_bias_impl_npu(
 
   EXEC_NPU_CMD(aclnnAddRmsNormBias, x1, x2, gamma, beta, epsilon, y, rstd, x);
   return std::make_tuple(y, rstd, x);
+}
+
+std::tuple<at::Tensor, at::Tensor> rms_norm_cast_va_impl_npu(
+    const at::Tensor& x,
+    const at::Tensor& gamma,
+    double epsilon) {
+  // rstd = 1/sqrt(mean(x^2, -1) + eps); y = x*rstd*gamma (input dtype);
+  // y_fp32 = y widened to fp32 (already-rounded result for MoE routing).
+  at::Tensor y = at::empty(x.sizes(), x.options());
+  at::Tensor y_fp32 =
+      at::empty(x.sizes(), x.options().dtype(at::ScalarType::Float));
+  EXEC_NPU_CMD(aclnnRmsNormCastVa, x, gamma, epsilon, y, y_fp32);
+  return std::make_tuple(y, y_fp32);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -2291,6 +2421,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hc_post", &hc_post_impl_npu, "hc_post");
   m.def("hc_post_va", &hc_post_va_impl_npu, "hc_post_va");
   m.def("add_rms_norm_bias", &add_rms_norm_bias_impl_npu, "add_rms_norm_bias");
+  m.def("rms_norm_cast_va", &rms_norm_cast_va_impl_npu, "rms_norm_cast_va");
   m.def("gamma_add_rms_norm",
         &gamma_add_rms_norm_impl_npu,
         "gamma_add_rms_norm");
@@ -2310,6 +2441,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("laser_attention", &laser_attention_impl_npu, "laser_attention");
   m.def("x_flash_attention_infer", &x_flash_attention_infer_impl_npu, "x_flash_attention_infer");
   m.def("multi_latent_attention", &multi_latent_attention_impl_npu, "multi_latent_attention");
+  m.def("kv_quant_sparse_flash_attention_va",
+        &kv_quant_sparse_flash_attention_va_impl_npu,
+        "kv_quant_sparse_flash_attention_va");
   m.def("rms_norm_dynamic_quant", &rms_norm_dynamic_quant_impl_npu, "rms_norm_dynamic_quant");
   m.def("lightning_indexer_quant", &lightning_indexer_quant_impl_npu, "lightning_indexer_quant");
   m.def("compressor", &compressor_impl_npu, "compressor");
